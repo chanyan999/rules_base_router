@@ -1,0 +1,22 @@
+# Default Windows preset. No private profile is included in this repository.
+# To import this file, place your private vm1.conf beside it first.
+# Alternatively, first launch the app and import a profile under VPN exits;
+# the app fills the prepared vm1 exit and copies the profile into its own store.
+version: 1
+vpns:
+  vm1:
+    wireguard_config: ./vm1.conf
+dns:
+  server: 1.1.1.1
+  via: vm1
+  strategy: prefer_ipv4
+routing:
+  default: direct
+  rules:
+    - name: codex
+      match:
+        process_names:
+          - ChatGPT.exe
+          - codex.exe
+          - codex-code-mode-host.exe
+      via: vm1

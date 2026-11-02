@@ -4,7 +4,9 @@ use crate::{
     wireguard,
 };
 use serde_json::{json, Value};
-use std::{collections::BTreeMap, os::unix::fs::PermissionsExt, path::Path};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::{collections::BTreeMap, path::Path};
 
 pub struct Generated {
     pub json: Value,
@@ -15,10 +17,12 @@ pub struct Generated {
 pub fn generate(config: &Config) -> Result<Generated, String> {
     let mut profiles = BTreeMap::new();
     let mut endpoints = vec![];
+    #[allow(unused_mut)]
     let mut warnings = vec![];
     for (name, vpn) in &config.vpns {
         let wg = wireguard::Config::load(Path::new(&vpn.wireguard_config))
             .map_err(|e| format!("VPN {name}: {e}"))?;
+        #[cfg(unix)]
         if std::fs::metadata(&vpn.wireguard_config)
             .is_ok_and(|m| m.permissions().mode() & 0o077 != 0)
         {
@@ -71,15 +75,23 @@ fn generate_with_profiles(
     // Reject unavailable IPv6 before sniff accepts a TCP handshake. The engine
     // evaluates its monitored physical interface rather than our synthetic TUN.
     if !profiles.values().any(|p| p.supports_ip_version(6)) {
-        rules.push(json!({"type": "logical", "mode": "and", "rules": [
-            {"ip_version": 6}, {"type": "logical", "mode": "or", "invert": true, "rules": [
-                {"default_interface_address": ["2000::/3"]}, {"default_interface_address": ["fc00::/7"]}
-            ]}], "action": "reject", "method": "default", "no_drop": true}));
+        rules.extend(outbound_family_guards("direct", &profiles, None));
     }
-    rules.push(json!({"action": "sniff", "timeout": "300ms"}));
+    // Process/IP rules can be decided during TUN pre-match. A TCP sniff action
+    // stops pre-match and accepts the handshake, so don't insert it until a
+    // domain selector actually needs it. In particular, a dual-stack VPN must
+    // not prevent the later direct fallback from rejecting unavailable IPv6.
+    let mut sniffed = false;
     for rule in &config.routing.rules {
-        rules.extend(family_guards(
-            profiles.get(&rule.via),
+        if !sniffed
+            && (!rule.r#match.domains.is_empty() || !rule.r#match.domain_suffixes.is_empty())
+        {
+            rules.push(json!({"action": "sniff", "timeout": "300ms"}));
+            sniffed = true;
+        }
+        rules.extend(outbound_family_guards(
+            &rule.via,
+            &profiles,
             Some(compile_match(&rule.r#match)),
         ));
         rules.push(compile_rule(rule));
@@ -92,7 +104,11 @@ fn generate_with_profiles(
             }
         }
     }
-    rules.extend(family_guards(profiles.get(&config.routing.default), None));
+    rules.extend(outbound_family_guards(
+        &config.routing.default,
+        &profiles,
+        None,
+    ));
     let mut root = json!({
         "log": {"level": "info", "timestamp": true}, "dns": dns,
         "inbounds": [{"type": "tun", "tag": "vpnctl-tun", "address": ["172.31.255.1/30", "fd7a:7650:6e63::1/126"],
@@ -100,6 +116,29 @@ fn generate_with_profiles(
         "outbounds": [{"type": "direct", "tag": "direct", "domain_resolver": "vpnctl-dns"}],
         "route": {"auto_detect_interface": true, "find_process": true, "default_domain_resolver": "vpnctl-bootstrap", "rules": rules, "final": config.routing.default}
     });
+    #[cfg(windows)]
+    {
+        root["inbounds"][0]["interface_name"] = json!("RouteBar");
+        root["inbounds"][0]["strict_route"] = json!(true);
+        if !endpoints.is_empty() {
+            // A detour uses the peer's address family rather than the engine's
+            // dual-stack listener. On Windows an IPv6-disabled physical adapter
+            // otherwise makes the WireGuard bind fail even for an IPv4 peer.
+            // Keep endpoint DNS independent of DNS routed inside the tunnel.
+            root["outbounds"].as_array_mut().unwrap().push(json!({
+                "type": "direct", "tag": "vpnctl-transport",
+                "domain_resolver": "vpnctl-bootstrap"
+            }));
+        }
+    }
+    #[cfg(windows)]
+    let endpoints: Vec<Value> = endpoints
+        .into_iter()
+        .map(|mut endpoint| {
+            endpoint["detour"] = json!("vpnctl-transport");
+            endpoint
+        })
+        .collect();
     if !endpoints.is_empty() {
         root["endpoints"] = json!(endpoints);
     }
@@ -121,6 +160,32 @@ pub fn dns_strategy(
         (false, false) => Err("VPN profiles have no common IP address family; set an explicit dns.strategy and review per-VPN reachability".into()),
     }
 }
+fn outbound_family_guards(
+    via: &str,
+    profiles: &BTreeMap<String, wireguard::Config>,
+    selector: Option<Value>,
+) -> Vec<Value> {
+    if via != "direct" {
+        return family_guards(profiles.get(via), selector);
+    }
+    // Evaluate the monitored egress interface at connection time, not the TUN
+    // address or the capabilities of an unrelated WireGuard profile. Keep this
+    // guard adjacent to its route so earlier VPN exceptions retain precedence.
+    let mut conditions = vec![
+        json!({"ip_version": 6}),
+        json!({"type": "logical", "mode": "or", "invert": true, "rules": [
+            {"default_interface_address": ["2000::/3"]},
+            {"default_interface_address": ["fc00::/7"]}
+        ]}),
+    ];
+    if let Some(selector) = selector {
+        conditions.push(selector);
+    }
+    vec![
+        json!({"type": "logical", "mode": "and", "rules": conditions,
+        "action": "reject", "method": "default", "no_drop": true}),
+    ]
+}
 fn family_guards(profile: Option<&wireguard::Config>, selector: Option<Value>) -> Vec<Value> {
     let Some(profile) = profile else {
         return vec![];
@@ -134,22 +199,34 @@ fn family_guards(profile: Option<&wireguard::Config>, selector: Option<Value>) -
 pub fn compile_match(selector: &Match) -> Value {
     let mut groups = vec![];
     let mut apps = vec![];
-    let paths: Vec<_> = selector
-        .apps
-        .iter()
-        .filter(|s| !s.ends_with(".app"))
-        .collect();
-    let bundles: Vec<_> = selector
-        .apps
-        .iter()
-        .filter(|s| s.ends_with(".app"))
-        .map(|s| config::app_regex(s))
-        .collect();
-    if !paths.is_empty() {
-        apps.push(json!({"process_path": paths}));
+    #[cfg(windows)]
+    if !selector.apps.is_empty() {
+        let paths: Vec<_> = selector
+            .apps
+            .iter()
+            .map(|p| config::windows_app_regex(p))
+            .collect();
+        apps.push(json!({"process_path_regex": paths}));
     }
-    if !bundles.is_empty() {
-        apps.push(json!({"process_path_regex": bundles}));
+    #[cfg(not(windows))]
+    {
+        let paths: Vec<_> = selector
+            .apps
+            .iter()
+            .filter(|s| !s.ends_with(".app"))
+            .collect();
+        let bundles: Vec<_> = selector
+            .apps
+            .iter()
+            .filter(|s| s.ends_with(".app"))
+            .map(|s| config::app_regex(s))
+            .collect();
+        if !paths.is_empty() {
+            apps.push(json!({"process_path": paths}));
+        }
+        if !bundles.is_empty() {
+            apps.push(json!({"process_path_regex": bundles}));
+        }
     }
     if !selector.process_names.is_empty() {
         apps.push(json!({"process_name": selector.process_names}));
@@ -217,6 +294,9 @@ fn visit_secrets(value: &mut Value, visit: &mut impl FnMut(&mut Value)) {
 mod tests {
     use super::*;
     fn config() -> Config {
+        #[cfg(windows)]
+        return Config::from_text("version: 1\nvpns: {jp: {wireguard_config: C:/tmp/test.conf}}\nrouting:\n  rules:\n    - {name: exception, match: {domain_suffixes: [company.example]}, via: direct}\n    - {name: browser, match: {apps: ['C:/Program Files/A+B/app.exe'], process_names: [curl.exe], domains: [example.org]}, via: jp}\n", Path::new("C:/config.yaml")).unwrap();
+        #[cfg(not(windows))]
         Config::from_text("version: 1\nvpns: {jp: {wireguard_config: /tmp/test.conf}}\nrouting:\n  rules:\n    - {name: exception, match: {domain_suffixes: [company.example]}, via: direct}\n    - {name: browser, match: {apps: [/Applications/A+B.app], process_names: [curl], domains: [example.org]}, via: jp}\n", Path::new("/config.yaml")).unwrap()
     }
     fn profiles() -> BTreeMap<String, wireguard::Config> {
@@ -239,20 +319,30 @@ mod tests {
         assert_eq!(rules[0]["action"], "hijack-dns");
         assert_eq!(rules[1]["action"], "reject");
         assert_eq!(rules[2]["action"], "sniff");
-        assert_eq!(rules[3]["outbound"], "direct");
-        assert_eq!(rules[4]["action"], "reject");
-        assert_eq!(rules[5]["outbound"], "jp");
+        assert_eq!(rules[3]["action"], "reject");
+        assert_eq!(rules[4]["outbound"], "direct");
+        assert_eq!(rules[5]["action"], "reject");
+        assert_eq!(rules[6]["outbound"], "jp");
         assert_eq!(
-            rules[4]["rules"][0],
+            rules[5]["rules"][0],
             compile_match(&c.routing.rules[1].r#match)
         );
-        assert_eq!(rules[4]["rules"][1]["ip_version"], 6);
+        assert_eq!(rules[5]["rules"][1]["ip_version"], 6);
+        #[cfg(not(windows))]
         assert_eq!(
-            rules[5]["rules"][0]["rules"][0]["process_path_regex"],
+            rules[6]["rules"][0]["rules"][0]["process_path_regex"],
             json!(["^/Applications/A\\+B\\.app/"])
         );
-        assert_eq!(rules[5]["rules"][0]["mode"], "or");
-        assert_eq!(rules[5]["mode"], "and");
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                rules[6]["rules"][0]["rules"][0]["process_path_regex"],
+                json!([r"(?i)^C:\\Program Files\\A\+B\\app\.exe$"])
+            );
+            assert_eq!(generated.json["inbounds"][0]["strict_route"], true);
+        }
+        assert_eq!(rules[6]["rules"][0]["mode"], "or");
+        assert_eq!(rules[6]["mode"], "and");
         assert_eq!(generated.json["route"]["final"], "direct");
         assert_eq!(generated.json["dns"]["servers"][1]["detour"], "direct");
     }
@@ -291,12 +381,97 @@ mod tests {
         c.routing.rules.truncate(1);
         let generated = generate_with_profiles(&c, profiles(), vec![], vec![]).unwrap();
         let rules = generated.json["route"]["rules"].as_array().unwrap();
-        assert_eq!(rules.len(), 5);
-        assert_eq!(rules[3]["outbound"], "direct");
+        assert_eq!(rules.len(), 6);
+        assert_eq!(rules[4]["outbound"], "direct");
         assert_eq!(
-            rules[4],
+            rules[5],
             json!({"ip_version": 6, "action": "reject", "method": "default", "no_drop": true})
         );
+    }
+
+    fn dual_stack_split_config() -> (Config, BTreeMap<String, wireguard::Config>) {
+        let mut c = config();
+        c.dns.via = "jp".into();
+        c.dns.strategy = "prefer_ipv4".into();
+        c.routing.rules = vec![Rule {
+            name: "codex".into(),
+            r#match: Match {
+                process_names: vec![
+                    "ChatGPT.exe".into(),
+                    "codex.exe".into(),
+                    "codex-code-mode-host.exe".into(),
+                ],
+                ..Default::default()
+            },
+            via: "jp".into(),
+        }];
+        let p = BTreeMap::from([(
+            "jp".into(),
+            wireguard::Config::parse(&wireguard::tests::profile()).unwrap(),
+        )]);
+        (c, p)
+    }
+
+    #[test]
+    fn dual_stack_vpn_does_not_hide_direct_ipv6_guard() {
+        let (c, p) = dual_stack_split_config();
+        let generated = generate_with_profiles(&c, p, vec![], vec![]).unwrap();
+        let rules = generated.json["route"]["rules"].as_array().unwrap();
+        // No sniff may accept the browser TCP handshake before this guard.
+        assert!(!rules.iter().any(|r| r["action"] == "sniff"));
+        assert_eq!(rules.len(), 3);
+        assert_eq!(rules[1], compile_rule(&c.routing.rules[0]));
+        assert_eq!(rules[2]["action"], "reject");
+        assert_eq!(rules[2]["rules"][0]["ip_version"], 6);
+        assert_eq!(rules[2]["rules"][1]["invert"], true);
+        assert_eq!(
+            rules[2]["rules"][1]["rules"][0]["default_interface_address"],
+            json!(["2000::/3"])
+        );
+        assert_eq!(
+            rules[2]["rules"][1]["rules"][1]["default_interface_address"],
+            json!(["fc00::/7"])
+        );
+        assert_eq!(generated.json["dns"]["strategy"], "prefer_ipv4");
+        assert!(generated.json["dns"]["rules"].is_null());
+        assert_eq!(generated.json["dns"]["servers"][1]["detour"], "jp");
+    }
+
+    #[test]
+    fn explicit_direct_exception_is_guarded_before_default_vpn() {
+        let (mut c, p) = dual_stack_split_config();
+        c.routing.default = "jp".into();
+        c.routing.rules[0].via = "direct".into();
+        let generated = generate_with_profiles(&c, p, vec![], vec![]).unwrap();
+        let rules = generated.json["route"]["rules"].as_array().unwrap();
+        assert_eq!(rules.len(), 3);
+        assert_eq!(
+            rules[1]["rules"][2],
+            compile_match(&c.routing.rules[0].r#match)
+        );
+        assert_eq!(rules[1]["action"], "reject");
+        assert_eq!(rules[2]["outbound"], "direct");
+        assert_eq!(generated.json["route"]["final"], "jp");
+    }
+
+    #[test]
+    fn domain_rules_keep_order_and_sniff_only_when_needed() {
+        let (mut c, p) = dual_stack_split_config();
+        let mut domain_rule = config().routing.rules[0].clone();
+        domain_rule.via = "jp".into();
+        c.routing.rules.push(domain_rule);
+        let generated = generate_with_profiles(&c, p.clone(), vec![], vec![]).unwrap();
+        let rules = generated.json["route"]["rules"].as_array().unwrap();
+        assert_eq!(rules[1], compile_rule(&c.routing.rules[0]));
+        assert_eq!(rules[2]["action"], "sniff");
+        assert_eq!(rules[3], compile_rule(&c.routing.rules[1]));
+        // A domain exception placed first must not be bypassed by a later app rule.
+        c.routing.rules.swap(0, 1);
+        let generated = generate_with_profiles(&c, p, vec![], vec![]).unwrap();
+        let rules = generated.json["route"]["rules"].as_array().unwrap();
+        assert_eq!(rules[1]["action"], "sniff");
+        assert_eq!(rules[2], compile_rule(&c.routing.rules[0]));
+        assert_eq!(rules[3], compile_rule(&c.routing.rules[1]));
     }
 
     #[test]
@@ -331,6 +506,18 @@ mod tests {
             c.vpns.get_mut("jp").unwrap().wireguard_config = profile_path.to_string_lossy().into();
             let generated = generate(&c).unwrap();
             assert_eq!(generated.dns_strategy, strategy);
+            #[cfg(windows)]
+            {
+                assert_eq!(generated.json["endpoints"][0]["detour"], "vpnctl-transport");
+                let transport = generated.json["outbounds"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|outbound| outbound["tag"] == "vpnctl-transport")
+                    .unwrap();
+                assert_eq!(transport["type"], "direct");
+                assert_eq!(transport["domain_resolver"], "vpnctl-bootstrap");
+            }
             assert_eq!(
                 generated.json["endpoints"][0]["peers"][0]["persistent_keepalive_interval"],
                 25

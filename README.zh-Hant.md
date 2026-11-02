@@ -1,5 +1,33 @@
 # Rules Base Router
 
+## 本 fork 新增 Windows 版
+
+**Windows 0.2.2 預設分流：** `ChatGPT.exe`、`codex.exe`、
+`codex-code-mode-host.exe` 經 `vm1`，其他流量 direct，DNS 經 `vm1`。
+首次啟動會準備好規則，只需匯入私人 WireGuard profile；已有設定不會被覆蓋。
+repo 不包含私人 profile 或金鑰。
+[繁體中文使用及儲存說明](docs/WINDOWS.zh-Hant.md) · [版本紀錄](windows/CHANGELOG.md)
+
+支援 Windows 10/11 x64，提供原生桌面介面、WireGuard 匯入、應用程式／網域／IP
+規則、DNS 設定、驗證、連線及斷線。保留原有 macOS 程式。
+
+```powershell
+git clone https://github.com/Senachi124/rules_base_router.git
+cd rules_base_router
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1
+.\build\RouteBar-windows-x64\RouteBar.exe
+```
+
+編譯需要 Rust/rustup、Visual Studio C++ Build Tools 及 Windows SDK。
+完成後亦會產生 `build/RouteBar-windows-x64.zip`，解壓後保留所有檔案即可使用。
+按 Connect 時需要管理員授權；授權後會交接至管理員視窗並連線。
+最小化會留在通知區，關閉程式會停止 VPN，沒有開機服務。
+
+目前是 Windows 預覽版；離線測試及實機出口／DNS 檢查已通過，完整的路由清理、
+重連及跨權限驗收仍需在目標電腦進行。完整範圍見 [Windows 文件](docs/WINDOWS.zh-Hant.md)。
+
+## 原有 macOS 版
+
 macOS 原生 App，讓指定應用程式與網站經 WireGuard VPN 連線，其餘流量保持直連。
 
 App 名稱為 **RouteBar**，使用 SwiftUI 介面、Rust 分流控制器及 sing-box 網絡引擎。本機編譯及使用不需要 Apple Developer certificate 或 Network Extension entitlement；修改系統路由仍需 macOS 管理員授權。
